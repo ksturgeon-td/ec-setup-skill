@@ -8,7 +8,10 @@ silently in the session but fail on the next provisioning cycle.
 ## Database Naming
 
 - Alphanumeric characters and underscores only — no dots, special characters, or spaces
-- Email-format names (e.g., `first.last@domain.com`) cause OMS repopulation failures
+- This restriction applies to databases explicitly created under `TD_PARENT` — system-managed
+  user accounts may have email-style names by design; do not try to rename those
+- Email-format names in explicitly created databases (e.g., `first.last_domain_com`) cause
+  OMS repopulation failures
 - Always create databases under `TD_PARENT`:
   ```sql
   CREATE DATABASE <name> FROM TD_PARENT AS PERM = 0;
@@ -41,15 +44,21 @@ The CE-specific role (e.g., `TD_CE_FinanceAnalysts`) is what appears in GRANT st
 
 ## Authorization Objects and Cross-Instance Replication
 
-| AUTH object location | DATALAKE replication |
-|----------------------|---------------------|
-| GLOBAL database | Replicates to all CE instances |
-| LOCAL database | Single CE instance only |
+AUTH placement rules differ by object type:
 
-- For shared, multi-instance access: **place AUTH objects in a GLOBAL database**
-- Use `AS DEFINER TRUSTED` for team-shared credentials
-- `AS INVOKER` = single-CE by definition; avoid for production datalakes
-- DATALAKE and FOREIGN SERVER/TABLE objects that depend on a LOCAL AUTH object will not replicate
+| Object type | AUTH requirement | Reason |
+|-------------|-----------------|--------|
+| DATALAKE | AUTH in GLOBAL database, plain (no DEFINER/INVOKER) | Datalakes replicate to all CE instances — auth must replicate too; DEFINER behavior with DATALAKE is untested |
+| FOREIGN TABLE | AUTH in same DB as the table, `AS DEFINER TRUSTED`, unqualified name in EXTERNAL SECURITY clause | Qualified `db.auth` raises Error 3706 |
+| READ_NOS view | AUTH in any accessible DB, plain (no DEFINER/INVOKER) | Ad-hoc access; no replication requirement |
+
+Additional rules:
+- `AS INVOKER` auth = single-CE by definition; suitable for READ_NOS, not for production datalakes
+- AUTH objects that depend on LOCAL databases will not replicate with datalakes
+
+**INVOKER note:** When using `AS INVOKER`, the auth object can generally be created by an
+Admin in any database, or by a Curator in databases they own. Exact privilege requirements
+may vary — verify with `HELP DATABASE <db>` to confirm CREATE AUTHORIZATION rights.
 
 ---
 
