@@ -1,3 +1,8 @@
+---
+name: elastic-compute-setup
+description: Self-service data source setup on Teradata Elastic Compute. Guides users through role detection, auth objects, datalakes, foreign tables, views, and access grants based on their EC role (TD_ACCESS, TD_CREATOR, TD_ADMIN).
+---
+
 # Elastic Compute Setup Skill
 
 ## Purpose
