@@ -34,11 +34,9 @@ GRANT SELECT ON mydb TO td_ce_data_user_role;
 GRANT EXECUTE FUNCTION ON mydb.my_udf TO td_ce_data_user_role;
 ```
 
-To find the role name to grant to, query:
-```sql
-SELECT RoleName FROM DBC.AllRoleRightsV WHERE DatabaseName = USER;
-```
-The CE-specific role (e.g., `TD_CE_FinanceAnalysts`) is what appears in GRANT statements.
+To find the role name to grant to, use the Step 1 queries in the skill. Role naming
+conventions vary by deployment — look for patterns like `TD_ACCESS`, `*_DATA_USER`, or
+site-specific names. Do not assume a `TD_CE_*` prefix exists on every system.
 
 ---
 
@@ -46,11 +44,16 @@ The CE-specific role (e.g., `TD_CE_FinanceAnalysts`) is what appears in GRANT st
 
 AUTH placement rules differ by object type:
 
-| Object type | AUTH requirement | Reason |
-|-------------|-----------------|--------|
-| DATALAKE | AUTH in GLOBAL database, plain (no DEFINER/INVOKER) | Datalakes replicate to all CE instances — auth must replicate too; DEFINER behavior with DATALAKE is untested |
-| FOREIGN TABLE | AUTH in same DB as the table, `AS DEFINER TRUSTED`, unqualified name in EXTERNAL SECURITY clause | Qualified `db.auth` raises Error 3706 |
-| READ_NOS view | AUTH in any accessible DB, plain (no DEFINER/INVOKER) | Ad-hoc access; no replication requirement |
+| Object type | AUTH requirement | EXTERNAL SECURITY reference |
+|-------------|-----------------|----------------------------|
+| DATALAKE | AUTH in GLOBAL database, plain (no `AS` clause) | `EXTERNAL SECURITY CATALOG <db>.<auth>` — qualified name, no keywords |
+| FOREIGN TABLE (plain) | AUTH in any accessible DB, plain | `EXTERNAL SECURITY <db>.<auth>` — qualified name, no keywords |
+| FOREIGN TABLE (DEFINER) | AUTH in **same DB as the table**, `AS DEFINER TRUSTED` | `EXTERNAL SECURITY DEFINER TRUSTED <auth>` — unqualified only; Error 3706 if qualified |
+| READ_NOS view | AUTH in any accessible DB, plain | `AUTHORIZATION (<db>.<auth_name>)` — qualified, no keywords |
+
+**Matching rule:** The keywords in `EXTERNAL SECURITY` must match how the auth object was
+created. A mismatch raises Error 6953 (`authorization definition does not match`) or
+Error 3706 (qualified name with DEFINER TRUSTED).
 
 Additional rules:
 - `AS INVOKER` auth = single-CE by definition; suitable for READ_NOS, not for production datalakes
@@ -69,14 +72,21 @@ New databases start with `PERM = 0` — correct for databases that only hold vie
 PERM space is required for: stored procedures, UDFs, table operators, and foreign tables.
 
 ```sql
--- Allocate space (Admin / Data Curator with Admin privileges)
-CALL TD_GLOBAL.ChangeSpace('<db_name>', <bytes>, :msg);
+-- Check parent headroom before allocating
+SELECT DatabaseName, PermSpace, CurrentPerm
+FROM DBC.DatabasesV WHERE DatabaseName = 'TD_PARENT';
 
--- Grant stored procedure and function creation rights on a database
+-- Add bytes to the target database (2nd argument is bytes TO ADD, not total)
+CALL TD_GLOBAL.ChangeSpace('<db_name>', <bytes_to_add>, :msg);
+-- Always read :msg — failure appears as text in the output (e.g. Failure 3541)
+-- Then re-query to confirm:
+SELECT DatabaseName, PermSpace FROM DBC.DatabasesV WHERE DatabaseName = '<db_name>';
+
+-- Grant stored procedure and function creation rights (LOCAL databases only)
+-- GRANT_USER_DB_PRIVS works on TD_PARENT-owned local DBs; does NOT apply to
+-- global databases or authorization/table rights
 CALL TD_GLOBAL.GRANT_USER_DB_PRIVS('<db_name>', 'TD_CREATOR');
 ```
-
-Ensure `TD_PARENT` has sufficient space before allocating to a child database.
 
 ---
 

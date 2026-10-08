@@ -31,21 +31,38 @@ Invoke this skill when a user on an Elastic Compute instance asks to:
 
 ## Step 1 — Identify the User's Role
 
-`SELECT CURRENT_ROLE` returns "ALL" on Elastic Compute — use this query instead:
+`SELECT CURRENT_ROLE` returns "ALL" on Elastic Compute — use these queries instead:
 
 ```sql
+-- Roles held by the current user
 SELECT DISTINCT RoleName FROM DBC.AllRoleRightsV WHERE DatabaseName = USER;
+
+-- Cross-check against known EC role names on this site
+SELECT DISTINCT RoleName FROM DBC.RoleInfoV
+WHERE RoleName IN ('TD_ACCESS', 'TD_CREATOR', 'TD_ADMIN')
+   OR RoleName LIKE '%DATA_USER%'
+   OR RoleName LIKE '%DATA_CURATOR%'
+ORDER BY 1;
 ```
 
 | Role found | Persona | Proceed to |
 |------------|---------|-----------|
-| `TD_ACCESS` | Data User | Step 2A — Discovery |
-| `TD_CREATOR` | Data Curator | Step 2B — Setup |
-| `TD_ADMIN` | Admin | Step 2B — Setup (treat as Curator; Admin role may not be active) |
+| `TD_ACCESS` or `*_DATA_USER` | Data User — can discover and query existing sources | Step 2A — Discovery |
+| `*_DATA_CURATOR` | Data Curator — can create auth objects and tables in global databases | Step 2B — Setup |
+| `TD_CREATOR` or `TD_ADMIN` | Admin — can create local databases, datalakes, call `TD_GLOBAL` procs, but **no rights inside global databases by default** | Step 2B — with rights check |
 | None of the above | Unknown | Ask user to contact their EC admin to confirm role assignment |
 
-> Note: `TD_ADMIN` may or may not be present in a given deployment. When it is, treat the
-> user as a Data Curator — Admin-specific capabilities are not yet enabled at the DB level.
+> **Rights check for TD_CREATOR / TD_ADMIN:** Before proceeding to object creation, verify
+> the user's roles have `CREATE AUTHORIZATION` (CA) or `CREATE TABLE` (CT) rights on the
+> target global database. Without them, DDL will fail with Error 3524.
+> ```sql
+> SELECT DISTINCT RoleName, AccessRight
+> FROM DBC.AllRoleRightsV
+> WHERE DatabaseName = '<global_db>' AND AccessRight IN ('CA', 'CT');
+> ```
+> If none of the user's roles appear, advise: "You can create local objects and datalakes,
+> but creating auth objects or tables in `<global_db>` requires a Data Curator role. Ask
+> your EC admin."
 
 ---
 
@@ -60,18 +77,26 @@ or foreign tables.
 
 ```sql
 -- Foreign servers and datalakes registered in TD_SERVER_DB
-SELECT ServerName, DataBaseName, AuthorizationName, TableFormat
+SELECT ServerName, DataBaseName, TableFormat, AuthorizationName, CatalogAuthName
 FROM DBC.ServerV
 ORDER BY ServerName;
 -- Kind = 'K' objects in HELP DATABASE TD_SERVER_DB are datalakes/foreign servers
+-- AuthorizationType may appear blank in some deployments
+```
+
+Once you have a datalake name, get its full DDL (including auth names and catalog config):
+```sql
+SHOW DATALAKE <datalake_name>;
 ```
 
 **Secondary — DBC.DatalakeInfoV (may raise Error 3523 on some systems):**
 
 ```sql
 -- If accessible, gives catalog metadata for OTF datalakes
+-- Note: string values include embedded single quotes, e.g. 'glue' not glue
 SELECT DatalakeName, OTFTableFormat, CatalogType, CatalogLocation,
-       StorageLocation, StorageEndPoint, StorageRegion
+       StorageLocation, StorageEndPoint, StorageRegion,
+       UnityCatalogName, StorageAccountName
 FROM DBC.DatalakeInfoV
 ORDER BY DatalakeName;
 -- If Error 3523 or empty result, fall back to DBC.ServerV + SHOW DATALAKE <name>
@@ -152,8 +177,9 @@ Ask the user what they are connecting to:
 **Step A1 — Create the AUTH object in the global database**
 
 Place the AUTH object in the global database so the datalake replicates across all CE
-instances. For DATALAKE objects, use plain `CREATE AUTHORIZATION` (no DEFINER/INVOKER) —
-`AS DEFINER TRUSTED` with DATALAKE is untested and may not be supported.
+instances. Use plain `CREATE AUTHORIZATION` (no `AS DEFINER/INVOKER`) — the EXTERNAL
+SECURITY reference in Step A2 must match: plain auth → no keywords in the reference,
+qualified name allowed. Mixing types raises Error 6953 or Error 3706.
 
 ```sql
 -- Standard key/secret (AWS, GCS, NIM)
@@ -181,13 +207,25 @@ For full AUTH object syntax, load `get_syntax_help(topic="authorization-objects"
 
 **Step A2 — Create the DATALAKE in TD_SERVER_DB**
 
+Plain auth → no keywords in EXTERNAL SECURITY, qualified name allowed:
+
 ```sql
 CREATE DATALAKE <datalake_name>
-    EXTERNAL SECURITY DEFINER TRUSTED CATALOG <global_db>.<auth_name>,
-    EXTERNAL SECURITY DEFINER TRUSTED STORAGE <global_db>.<auth_name>
-USING catalog_type('<glue|unity|hive|rest|fabric|biglake>')
-      ... TABLE FORMAT <ICEBERG|DELTA>;
+    EXTERNAL SECURITY CATALOG <global_db>.<auth_name>,
+    EXTERNAL SECURITY STORAGE <global_db>.<auth_name>
+USING
+    catalog_type     ('<glue|unity|hive|rest|fabric|biglake>')
+    storage_location ('s3://<bucket>/<prefix>/')
+    storage_region   ('<region>')
+TABLE FORMAT iceberg;   -- or: deltalake  (NOT "delta")
 ```
+
+> **Auth / EXTERNAL SECURITY matching rule:**
+> | Auth created as | EXTERNAL SECURITY reference | Qualified name? |
+> |---|---|---|
+> | Plain (no `AS` clause) | `EXTERNAL SECURITY CATALOG <db>.<auth>` | Yes — verified |
+> | `AS DEFINER TRUSTED` | `EXTERNAL SECURITY DEFINER TRUSTED <auth>` | No — Error 3706 |
+> Mismatch raises Error 6953 (`authorization definition does not match`).
 
 For full `CREATE DATALAKE` syntax including catalog-specific parameters (catalog URL,
 storage location, table format options), load `get_syntax_help(topic="open-table-format")`.
@@ -205,22 +243,13 @@ WHERE <filter>;
 **Step A4 — Grant access to the Data User role at the DATABASE level**
 
 ```sql
--- Grant on the global database (covers auth objects and views)
-GRANT SELECT ON <global_db> TO <td_ce_data_user_role>;
-
--- Grant EXECUTE on the auth object so users can use it
-GRANT EXECUTE ON <global_db>.<auth_name> TO <td_ce_data_user_role>;
-
--- Grant on TD_SERVER_DB so users can query datalake tables directly
--- (DATALAKE objects live in TD_SERVER_DB — users need SELECT here to reach them)
-GRANT SELECT ON TD_SERVER_DB TO <td_ce_data_user_role>;
+-- Database-level SELECT and EXECUTE — covers views, tables, and auth objects in the DB
+GRANT SELECT  ON <global_db> TO <data_user_role>;
+GRANT EXECUTE ON <global_db> TO <data_user_role>;
 ```
 
-To find the correct CE Data User role name:
-```sql
-SELECT DISTINCT RoleName FROM DBC.AllRoleRightsV
-WHERE DatabaseName = USER AND RoleName LIKE 'TD_CE_%';
-```
+To find the data user role name, use the Step 1 queries — look for roles matching
+`TD_ACCESS`, `*_DATA_USER`, or the site's naming convention.
 
 > See `reference/ec-constraints.md` for critical rules on ACCESSRIGHTS persistence.
 
@@ -237,11 +266,21 @@ Best for file-based object store data where multiple users need persistent, perf
 4. Credentials
 5. Table name (alphanumeric and underscores only)
 
-**Step B1 — Create the AUTH object in the same database as the table**
+**Step B1 — Create the AUTH object**
 
-For FOREIGN TABLE, use `AS DEFINER TRUSTED` and place the auth object in the **same
-database as the table**. Reference it with an unqualified name in the EXTERNAL SECURITY
-clause — using a qualified name (db.auth) raises Error 3706.
+Two verified patterns — choose one and use it consistently through B2:
+
+**Option 1 — Plain auth (recommended for simplicity):** Auth can be in any database the
+curator has access to; reference with qualified name, no keywords in EXTERNAL SECURITY.
+
+```sql
+CREATE AUTHORIZATION <db>.<auth_name>
+    USER  '<access_key>'
+    PASSWORD '<secret_key>';
+```
+
+**Option 2 — DEFINER TRUSTED:** Auth must be in the **same database as the table**;
+reference with **unqualified name** — qualified name raises Error 3706.
 
 ```sql
 CREATE AUTHORIZATION <db>.<auth_name>
@@ -252,33 +291,47 @@ CREATE AUTHORIZATION <db>.<auth_name>
 
 **Step B2 — Create the FOREIGN TABLE**
 
-The database hosting the foreign table needs PERM space. First verify `TD_PARENT` has
-sufficient free space, then allocate to the child database:
+The database hosting the foreign table needs PERM space. `ChangeSpace` adds bytes —
+check parent headroom first, read `out_msg` to confirm success:
 
 ```sql
--- Check TD_PARENT free space (optional but recommended)
-SELECT PermSpace, CurrentPerm, MaxPerm
-FROM DBC.AllSpaceV WHERE DatabaseName = 'TD_PARENT';
+-- Check TD_PARENT free space
+SELECT DatabaseName, PermSpace, CurrentPerm
+FROM DBC.DatabasesV WHERE DatabaseName = 'TD_PARENT';
 
--- Allocate space to the target database
+-- Add bytes to the target database (2nd arg is bytes to ADD, not total)
 CALL TD_GLOBAL.ChangeSpace('<db_name>', 10000000, :msg);
+-- Read :msg — failure appears as text inside the output variable (e.g. Failure 3541)
 
--- Verify allocation succeeded
-SELECT CurrentPerm, MaxPerm FROM DBC.AllSpaceV WHERE DatabaseName = '<db_name>';
+-- Confirm allocation
+SELECT DatabaseName, PermSpace FROM DBC.DatabasesV WHERE DatabaseName = '<db_name>';
 ```
 
-Then create the table. Use a valid LOCATION URI — either slash-path or s3:// form:
+Then create the table. The EXTERNAL SECURITY reference must match the auth pattern chosen
+in B1. **LOCATION note:** `/s3/my-bucket/path/` treats `my-bucket` as the hostname and
+fails at query time — always use the endpoint form or s3:// URI.
 
 ```sql
+-- Option 1: plain auth, qualified reference (no keywords)
 CREATE MULTISET FOREIGN TABLE <db>.<table_name>,
-    EXTERNAL SECURITY DEFINER TRUSTED <auth_name>
+    EXTERNAL SECURITY <db>.<auth_name>
     USING (
-        LOCATION  ('/S3/s3.amazonaws.com/my-bucket/path/')
+        LOCATION  ('/S3/s3.amazonaws.com/<bucket>/<prefix>/')
         STOREDAS  ('PARQUET')
     )
 NO PRIMARY INDEX;
+
+-- Option 2: DEFINER TRUSTED auth, unqualified reference (auth in same DB)
+CREATE MULTISET FOREIGN TABLE <db>.<table_name>,
+    EXTERNAL SECURITY DEFINER TRUSTED <auth_name>
+    USING (
+        LOCATION  ('/S3/s3.amazonaws.com/<bucket>/<prefix>/')
+        STOREDAS  ('PARQUET')
+    )
+NO PRIMARY INDEX;
+
 -- Valid LOCATION formats:
---   /S3/s3.amazonaws.com/bucket/prefix/      (slash-path, note uppercase S3)
+--   /S3/s3.amazonaws.com/bucket/prefix/      (slash-path, uppercase S3)
 --   s3://bucket/prefix/                       (URI form)
 --   /AZ/storageacct.blob.core.windows.net/container/prefix/
 --   /GS/storage.googleapis.com/bucket/prefix/
@@ -294,15 +347,12 @@ SELECT * FROM <db>.<table_name>;
 **Step B4 — Grant access**
 
 ```sql
-GRANT SELECT ON <db> TO <td_ce_data_user_role>;
-GRANT EXECUTE ON <db>.<auth_name> TO <td_ce_data_user_role>;
+-- Database-level grants — persist through reprovisioning
+GRANT SELECT  ON <db> TO <data_user_role>;
+GRANT EXECUTE ON <db> TO <data_user_role>;
 ```
 
-To find the correct CE Data User role name:
-```sql
-SELECT DISTINCT RoleName FROM DBC.AllRoleRightsV
-WHERE DatabaseName = USER AND RoleName LIKE 'TD_CE_%';
-```
+Use the Step 1 queries to find the correct data user role name.
 
 For full NOS syntax (PATHPATTERN, schema inference, SNAPSHOT_LOCATION, import workflow),
 load `get_syntax_help(topic="object-store")`.
@@ -333,16 +383,17 @@ CREATE AUTHORIZATION <db>.<auth_name>
 **Step C2 — Create a view using READ_NOS**
 
 Use the explicit `READ_NOS(USING ...)` table operator form — inline shorthand is not
-supported in view definitions:
+supported in view definitions. **Note:** `CREATE VIEW` over `READ_NOS` contacts the
+bucket at creation time, so credentials and the storage path must be valid and reachable.
 
 ```sql
 CREATE VIEW <db>.<view_name> AS
 SELECT *
 FROM READ_NOS (
     USING
-        LOCATION ('/S3/s3.amazonaws.com/my-bucket/path/')
-        AUTHORIZATION (COLUMN <db>.<auth_name>)
-        STOREDAS ('PARQUET')
+        LOCATION      ('/S3/s3.amazonaws.com/<bucket>/<prefix>/')
+        AUTHORIZATION (<db>.<auth_name>)
+        STOREDAS      ('PARQUET')
 ) AS d;
 -- Valid LOCATION formats:
 --   /S3/s3.amazonaws.com/bucket/prefix/   (slash-path)
@@ -352,9 +403,11 @@ FROM READ_NOS (
 **Step C3 — Grant access**
 
 ```sql
-GRANT SELECT ON <db> TO <td_ce_data_user_role>;
-GRANT EXECUTE ON <db>.<auth_name> TO <td_ce_data_user_role>;
+GRANT SELECT  ON <db> TO <data_user_role>;
+GRANT EXECUTE ON <db> TO <data_user_role>;
 ```
+
+Use the Step 1 queries to find the correct data user role name.
 
 For full READ_NOS syntax, load `get_syntax_help(topic="object-store")`.
 
@@ -366,12 +419,13 @@ Load `reference/ec-constraints.md` for the full list. Key rules to apply in ever
 
 | Rule | What to do |
 |------|-----------|
-| Database names | Alphanumeric + underscores only (no dots/spaces); create under `TD_PARENT` — this restriction applies to explicitly created databases, not system-managed user accounts |
-| AUTH placement (DATALAKE) | AUTH objects for DATALAKE objects must be in a GLOBAL database — datalakes always replicate globally, so their auth objects must too |
-| AUTH placement (NOS foreign tables) | Auth can be in the same database as the foreign table (local or global); must be DEFINER TRUSTED with unqualified name |
-| AUTH placement (READ_NOS views) | Auth can be in any database the curator has access to; plain auth (no DEFINER/INVOKER) |
-| ACCESSRIGHTS | Grant to ROLE at DATABASE level only — never to users or individual objects |
-| PERM space | Default `PERM = 0`; allocate only when storing UDFs, stored procs, or foreign tables |
+| Database names | Alphanumeric + underscores only; create under `TD_PARENT` — applies to explicitly created databases; system user accounts may use email-format names |
+| AUTH / EXTERNAL SECURITY matching | Plain auth → `EXTERNAL SECURITY <db>.<auth>` (no keywords, qualified OK); DEFINER TRUSTED → `EXTERNAL SECURITY DEFINER TRUSTED <auth>` (unqualified, same DB as object). Mismatch → Error 3706 or 6953 |
+| AUTH placement (DATALAKE) | Must be in a GLOBAL database — datalakes replicate globally; plain auth verified |
+| AUTH placement (NOS foreign tables) | Same DB as the table for DEFINER TRUSTED pattern; any accessible DB for plain auth pattern |
+| AUTH placement (READ_NOS views) | Any accessible DB; plain auth |
+| ACCESSRIGHTS | Grant to ROLE at DATABASE level only (`GRANT SELECT/EXECUTE ON <db> TO <role>`) — object-level grants do not survive reprovisioning |
+| PERM space | Default `PERM = 0`; allocate only for foreign tables, UDFs, stored procs. `ChangeSpace` adds bytes — always read `out_msg` and re-query PermSpace to confirm |
 | PERM tables | Never rely on them for persistent data — use OTF or NOS |
 
 ---
