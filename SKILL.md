@@ -31,18 +31,17 @@ Invoke this skill when a user on an Elastic Compute instance asks to:
 
 ## Step 1 — Identify the User's Role
 
-`SELECT CURRENT_ROLE` returns "ALL" on Elastic Compute — use these queries instead:
+`SELECT CURRENT_ROLE` returns "ALL" on Elastic Compute — use this query instead.
+It resolves nested role membership: finds the roles granted directly to the user, then
+joins to find what groups those roles belong to (effective roles):
 
 ```sql
--- Roles held by the current user
-SELECT DISTINCT RoleName FROM DBC.AllRoleRightsV WHERE DatabaseName = USER;
-
--- Cross-check against known EC role names on this site
-SELECT DISTINCT RoleName FROM DBC.RoleInfoV
-WHERE RoleName IN ('TD_ACCESS', 'TD_CREATOR', 'TD_ADMIN')
-   OR RoleName LIKE '%DATA_USER%'
-   OR RoleName LIKE '%DATA_CURATOR%'
-ORDER BY 1;
+-- Effective roles for a specific user (handles nested role assignments)
+SELECT u.Grantee, r.RoleName
+FROM DBC.RoleMembersV u
+INNER JOIN DBC.RoleMembersV r
+    ON u.RoleName = r.Grantee
+WHERE u.Grantee = '<username>';   -- e.g. 'kevin.sturgeon@TERADATA.COM'
 ```
 
 | Role found | Persona | Proceed to |
