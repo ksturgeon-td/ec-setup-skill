@@ -160,7 +160,8 @@ Ask the user what they are connecting to:
 |-------------|---------|
 | Iceberg or Delta Lake catalog (AWS Glue, Azure OneLake, Databricks Unity Catalog, GCP BigLake, Hive Metastore, Polaris, Gravitino, etc.) | **Workflow A — OTF Datalake** |
 | Files in S3 / Azure ADLS / GCS without an Iceberg catalog (Parquet, CSV, JSON) — persistent, shared access | **Workflow B — NOS Foreign Table** |
-| Files in S3 / Azure ADLS / GCS — exploratory or single-user access | **Workflow C — NOS Ad-hoc Read (READ_NOS view)** |
+| Files in S3 / Azure ADLS / GCS — exploratory or single-user access, auth object required | **Workflow C — NOS Ad-hoc Read (READ_NOS view)** |
+| Quick one-off query on S3 or Azure ADLS — no auth object needed, credentials inline | **Workflow D — Inline Credentials (easiest for new users)** |
 
 ---
 
@@ -423,6 +424,73 @@ GRANT EXECUTE ON <db> TO <data_user_role>;
 Use the Step 1 queries to find the correct data user role name.
 
 For full READ_NOS syntax, load `get_syntax_help(topic="object-store")`.
+
+---
+
+### Workflow D — Inline Credentials (No Auth Object Required)
+
+**Best for:** New users doing a quick one-off exploration of S3 or Azure ADLS data without
+setting up any auth objects first. **Supported platforms: S3 and Azure ADLSv2 only.**
+
+Instead of creating an authorization object, pass credentials as a JSON string directly in
+the `AUTHORIZATION` parameter. No `CREATE AUTHORIZATION` or `GRANT EXECUTE` needed.
+
+**Collect from the user:**
+1. Storage location (S3 URI or Azure ADLS path)
+2. Credentials (Access Key ID + Secret; Session Token if using STS)
+
+**Step D1 — Run an ad-hoc query**
+
+Credentials are embedded as a JSON string. Supported keys: `Access_ID`, `Access_Key`,
+`Session_Token` (optional — STS temporary creds only).
+
+```sql
+-- Explicit READ_NOS form (recommended)
+SELECT TOP 10 *
+FROM READ_NOS (
+    USING
+        LOCATION      ('/S3/s3.amazonaws.com/<bucket>/<prefix>/')
+        AUTHORIZATION ('{"Access_ID":"<access_key_id>","Access_Key":"<secret_key>"}')
+        RETURNTYPE    ('NOSREAD_KEYS')
+) AS d;
+
+-- Azure ADLS (same JSON format — Storage Account Name + Key)
+SELECT TOP 10 *
+FROM READ_NOS (
+    USING
+        LOCATION      ('/AZ/<storage_account>.blob.core.windows.net/<container>/<prefix>/')
+        AUTHORIZATION ('{"Access_ID":"<storage_account_name>","Access_Key":"<storage_account_key>"}')
+        RETURNTYPE    ('NOSREAD_KEYS')
+) AS d;
+
+-- Implicit shorthand form (also valid — recognize it but prefer explicit above)
+SELECT TOP 10 * FROM (
+    LOCATION      = '/S3/s3.amazonaws.com/<bucket>/<prefix>/'
+    AUTHORIZATION = '{"Access_ID":"<access_key_id>","Access_Key":"<secret_key>"}'
+    RETURNTYPE    = 'NOSREAD_KEYS'
+) AS d;
+```
+
+**Step D2 — (Optional) Wrap in a view**
+
+```sql
+CREATE VIEW <db>.<view_name> AS
+SELECT *
+FROM READ_NOS (
+    USING
+        LOCATION      ('/S3/s3.amazonaws.com/<bucket>/<prefix>/')
+        AUTHORIZATION ('{"Access_ID":"<access_key_id>","Access_Key":"<secret_key>"}')
+        STOREDAS      ('PARQUET')
+) AS d;
+-- Note: credentials are stored in the view definition — anyone with SELECT on
+-- the view can read them. Use a proper auth object (Workflow C) for shared views.
+```
+
+> **When to upgrade to Workflow C:** Once a data source is used by more than one person,
+> or when you want credentials out of the query text, create an auth object instead.
+> Inline credentials are visible in query logs and view DDL.
+
+For full READ_NOS syntax and additional examples, load `get_syntax_help(topic="object-store")`.
 
 ---
 
