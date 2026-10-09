@@ -72,15 +72,22 @@ New databases start with `PERM = 0` — correct for databases that only hold vie
 PERM space is required for: stored procedures, UDFs, table operators, and foreign tables.
 
 ```sql
--- Check parent headroom before allocating
-SELECT DatabaseName, PermSpace, CurrentPerm
-FROM DBC.DatabasesV WHERE DatabaseName = 'TD_PARENT';
+-- Check parent headroom (use DBC.DiskSpaceV — DBC.DatabasesV lacks CurrentPerm)
+SELECT DatabaseName,
+       SUM(MaxPerm)                    AS max_perm,
+       SUM(CurrentPerm)                AS cur_perm,
+       SUM(MaxPerm) - SUM(CurrentPerm) AS headroom
+FROM DBC.DiskSpaceV
+WHERE DatabaseName = 'TD_PARENT'
+GROUP BY 1;
 
--- Add bytes to the target database (2nd argument is bytes TO ADD, not total)
+-- Add bytes to the target database (2nd argument is bytes TO ADD, not total;
+-- must not exceed TD_PARENT headroom — Failure 3541 in :msg means exceeded)
+-- Run via execute_query so :msg is returned
 CALL TD_GLOBAL.ChangeSpace('<db_name>', <bytes_to_add>, :msg);
--- Always read :msg — failure appears as text in the output (e.g. Failure 3541)
--- Then re-query to confirm:
-SELECT DatabaseName, PermSpace FROM DBC.DatabasesV WHERE DatabaseName = '<db_name>';
+-- Always read :msg — failure appears as text in the output variable
+-- Confirm:
+SELECT SUM(MaxPerm) AS perm_allocated FROM DBC.DiskSpaceV WHERE DatabaseName = '<db_name>';
 
 -- Grant stored procedure and function creation rights (LOCAL databases only)
 -- GRANT_USER_DB_PRIVS works on TD_PARENT-owned local DBs; does NOT apply to

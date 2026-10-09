@@ -32,17 +32,24 @@ Invoke this skill when a user on an Elastic Compute instance asks to:
 ## Step 1 — Identify the User's Role
 
 `SELECT CURRENT_ROLE` returns "ALL" on Elastic Compute — use this query instead.
-It resolves nested role membership: finds the roles granted directly to the user, then
-joins to find what groups those roles belong to (effective roles):
+It shows both directly-granted roles and roles inherited through them:
 
 ```sql
--- Effective roles for a specific user (handles nested role assignments)
-SELECT u.Grantee, r.RoleName
+-- Direct + nested effective roles for a specific user
+-- Note: Grantee is returned lowercase — compare case-insensitively
+SELECT 'direct' AS src, RoleName
+FROM DBC.RoleMembersV WHERE Grantee = '<username>'
+UNION ALL
+SELECT 'nested', r.RoleName
 FROM DBC.RoleMembersV u
-INNER JOIN DBC.RoleMembersV r
-    ON u.RoleName = r.Grantee
-WHERE u.Grantee = '<username>';   -- e.g. 'kevin.sturgeon@TERADATA.COM'
+JOIN DBC.RoleMembersV r ON u.RoleName = r.Grantee
+WHERE u.Grantee = '<username>';
+-- e.g. '<username>' = 'kevin.sturgeon@teradata.com'
 ```
+
+> **Ignore `TD_SSO_*` / `SSO_EC*` roles** — these are SCIM synchronization artifacts
+> from the management plane, not EC data roles. Focus on: `TD_CREATOR`, `TD_ADMIN`,
+> `*_DATA_CURATOR`, `*_DATA_USER`, `TD_ACCESS`.
 
 | Role found | Persona | Proceed to |
 |------------|---------|-----------|
@@ -218,6 +225,9 @@ CREATE AUTHORIZATION <global_db>.<auth_name>
 
 For full AUTH object syntax, load `get_syntax_help(topic="authorization-objects")`.
 
+> **Caution:** `SHOW AUTHORIZATION` echoes the `USER` value (access key ID). Do not paste
+> its output into chat, tickets, or logs.
+
 **Step A2 — Create the DATALAKE in TD_SERVER_DB**
 
 Plain auth → no keywords in EXTERNAL SECURITY, qualified name allowed:
@@ -308,21 +318,36 @@ The database hosting the foreign table needs PERM space. `ChangeSpace` adds byte
 check parent headroom first, read `out_msg` to confirm success:
 
 ```sql
--- Check TD_PARENT free space
-SELECT DatabaseName, PermSpace, CurrentPerm
-FROM DBC.DatabasesV WHERE DatabaseName = 'TD_PARENT';
+-- Check TD_PARENT headroom (use DBC.DiskSpaceV — DatabasesV lacks CurrentPerm)
+SELECT DatabaseName,
+       SUM(MaxPerm)                    AS max_perm,
+       SUM(CurrentPerm)                AS cur_perm,
+       SUM(MaxPerm) - SUM(CurrentPerm) AS headroom
+FROM DBC.DiskSpaceV
+WHERE DatabaseName = 'TD_PARENT'
+GROUP BY 1;
 
--- Add bytes to the target database (2nd arg is bytes to ADD, not total)
-CALL TD_GLOBAL.ChangeSpace('<db_name>', 10000000, :msg);
--- Read :msg — failure appears as text inside the output variable (e.g. Failure 3541)
+-- Add bytes — must not exceed parent headroom; run via execute_query so :msg is returned
+CALL TD_GLOBAL.ChangeSpace('<db_name>', <bytes_to_add>, :msg);
+-- Always read :msg — failure appears inside it (e.g. "Failure 3541 ... invalid")
+-- If ChangeSpace fails, reduce <bytes_to_add> to stay within TD_PARENT headroom
 
 -- Confirm allocation
-SELECT DatabaseName, PermSpace FROM DBC.DatabasesV WHERE DatabaseName = '<db_name>';
+SELECT SUM(MaxPerm) AS perm_allocated
+FROM DBC.DiskSpaceV WHERE DatabaseName = '<db_name>';
 ```
+
+> **Note:** `<bytes_to_add>` must not exceed TD_PARENT's available headroom. On small or
+> shared instances this may be only a few hundred KB — query headroom first and size
+> accordingly. Failure 3541 in `:msg` means the requested amount exceeds what's available.
 
 Then create the table. The EXTERNAL SECURITY reference must match the auth pattern chosen
 in B1. **LOCATION note:** `/s3/my-bucket/path/` treats `my-bucket` as the hostname and
 fails at query time — always use the endpoint form or s3:// URI.
+
+> **Note:** `CREATE FOREIGN TABLE` contacts the bucket at creation time (and may sample
+> files for schema inference), so credentials and the storage path must be valid and
+> reachable. An invalid key fails the DDL with Error 4951.
 
 ```sql
 -- Option 1: plain auth, qualified reference (no keywords)
