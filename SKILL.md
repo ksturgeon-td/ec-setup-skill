@@ -182,18 +182,31 @@ SECURITY reference in Step A2 must match: plain auth → no keywords in the refe
 qualified name allowed. Mixing types raises Error 6953 or Error 3706.
 
 ```sql
--- Standard key/secret (AWS, GCS, NIM)
+-- AWS (IAM user): Access Key ID + Secret
 CREATE AUTHORIZATION <global_db>.<auth_name>
-    USER  '<access_key_or_service_account>'
-    PASSWORD '<secret_key>';
--- AWS only: add SESSION_TOKEN for STS-issued temporary credentials
---   SESSION_TOKEN '<aws_session_token>'
+    USER     '<aws_access_key_id>'
+    PASSWORD '<aws_access_key_secret>';
+-- AWS STS temporary creds: add SESSION_TOKEN '<aws_session_token>'
 
--- Azure additionally requires SESSION_TOKEN = API version
+-- Azure Shared Key: Storage Account Name + Storage Account Key
 CREATE AUTHORIZATION <global_db>.<auth_name>
-    USER  '<azure_endpoint_url>'
-    PASSWORD '<api_key>'
-    SESSION_TOKEN '<api_version>';
+    USER     '<storage_account_name>'
+    PASSWORD '<storage_account_key>';
+
+-- Azure SAS: Storage Account Name + Account SAS Token
+CREATE AUTHORIZATION <global_db>.<auth_name>
+    USER     '<storage_account_name>'
+    PASSWORD '<account_sas_token>';
+
+-- GCS (S3 interop mode): Access Key ID + Secret
+CREATE AUTHORIZATION <global_db>.<auth_name>
+    USER     '<gcs_access_key_id>'
+    PASSWORD '<gcs_access_key_secret>';
+
+-- GCS (native): Client Email + Private Key
+CREATE AUTHORIZATION <global_db>.<auth_name>
+    USER     '<service_account_client_email>'
+    PASSWORD '<service_account_private_key>';
 
 -- AWS IAM role assumption
 CREATE AUTHORIZATION <global_db>.<auth_name>
